@@ -1,0 +1,131 @@
+name: CI/CD Pipeline
+on:
+  push:
+    branches:
+      - master
+      - feature
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: Fetch all branches and tags
+        run: git fetch --prune --unshallow
+        
+      - name: Install hadolint
+        run: |
+          sudo wget -O /bin/hadolint https://github.com/hadolint/hadolint/releases/download/v2.9.3/hadolint-Linux-x86_64
+          sudo chmod +x /bin/hadolint
+
+      - name: Lint Dockerfile
+        run: hadolint Dockerfile
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+
+      - name: Scan Dockerfile for vulnerabilities
+        run: trivy fs --exit-code 1 --severity HIGH,CRITICAL .
+
+      - name: Determine Branch and Commit Count
+        id: determine_branch_and_commit_count
+        run: |
+          BRANCH=$(echo "${{ github.ref }}" | awk -F'/' '{print $NF}')
+          CURRENT_VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          MAJOR_VERSION=$(echo $CURRENT_VERSION | cut -d'.' -f1)
+          MINOR_VERSION=$(echo $CURRENT_VERSION | cut -d'.' -f2)
+          PATCH_VERSION=$(echo $CURRENT_VERSION | cut -d'.' -f3)
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          
+          if [ "$BRANCH" = "master" ]; then
+            NEW_VERSION=$(($MAJOR_VERSION + 1)).0.0
+          elif [[ "$BRANCH" == feature* ]]; then
+            IS_MERGE=$(git log --merges -n 1 --pretty=%P)
+            if [[ $IS_MERGE ]]; then
+              NEW_VERSION=$MAJOR_VERSION.$(($MINOR_VERSION + 1)).0
+            else
+              NEW_VERSION=$CURRENT_VERSION
+            fi
+          elif [[ "$BRANCH" == fixes* ]]; then
+            NEW_VERSION=$MAJOR_VERSION.$MINOR_VERSION.$(($PATCH_VERSION + 1))
+          else
+            echo "::error::Unsupported branch"
+            exit 1 
+          fi
+          mvn versions:set -DnewVersion=$NEW_VERSION -DgenerateBackupPoms=false
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          git add .
+          git commit -am "Bump version to $NEW_VERSION"
+          git push origin $BRANCH
+          echo "version=$NEW_VERSION" >> $GITHUB_ENV
+
+      - name: Install OWASP Dependency-Check
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget unzip
+          wget https://github.com/jeremylong/DependencyCheck/releases/download/v7.0.4/dependency-check-7.0.4-release.zip
+          unzip dependency-check-7.0.4-release.zip -d dependency-check
+          sudo ln -s $(pwd)/dependency-check/dependency-check/bin/dependency-check.sh /usr/local/bin/dependency-check
+
+      - name: Run Dependency-Check
+        run: |
+          dependency-check --project "my-app" --scan . --format "JSON" --prettyPrint
+          cat dependency-check-report.json
+        
+
+      - name: Build Docker Image
+        run: |
+           docker build -t simple-java-maven-app:latest --build-arg RUN_NUMBER=${{ env.version }} .
+ 
+      - name: cosign-installer
+        uses: sigstore/cosign-installer@v3.5.0
+
+      - name: Push Docker Image
+        run: |
+          docker login -u ${{ secrets.DOCKER_EMAIL }} -p ${{ secrets.DOCKER_HUB }}
+          docker tag simple-java-maven-app:latest denisiuss/simple-java-maven-app:${{ env.version }}
+          docker push denisiuss/simple-java-maven-app:${{ env.version }}
+            
+      - name: Sign the published Docker image
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: cosign sign --yes --key env://COSIGN_PRIVATE_KEY docker.io/denisiuss/simple-java-maven-app:${{ env.version }}
+          
+      - name: Verify images
+        env:
+          COSIGN_PUBLIC_KEY: ${{ secrets.COSIGN_PUBLIC_KEY }}
+        run: |
+          cosign verify --insecure-ignore-tlog --key env://COSIGN_PUBLIC_KEY docker.io/denisiuss/simple-java-maven-app:${{ env.version }}
+      #- uses: actions/setup-node@v3
+       # with:
+        #  node-version: '14'
+      #- name: Configure AWS credentials
+       # uses: aws-actions/configure-aws-credentials@v1
+       # with:
+        #  aws-access-key-id: '${{ secrets.AWS_ACCESS_KEY_ID }}'
+         # aws-secret-access-key: '${{ secrets.AWS_SECRET_ACCESS_KEY }}'
+          #aws-region: eu-central-1
+      #- name: Setup Terraform
+       # uses: hashicorp/setup-terraform@v2
+        #with:
+         # terraform_wrapper: false
+      #- name: Terraform Apply
+       # id:   apply
+        #run: |
+         # cd terraform/
+          #terraform init
+          #terraform validate
+          #terraform plan 
+          #terraform apply -auto-approve
+
+
